@@ -14,6 +14,7 @@ from bangumi_mcp.constants import (
 )
 from bangumi_mcp.formatters import (
     format_calendar,
+    format_index_subject,
     format_subject_detail,
     format_subject_summary,
     format_user_collection,
@@ -133,3 +134,9 @@ def test_format_calendar_and_collections() -> None:
     )
     assert ep["watch_status"] == "done"
     assert ep["watch_status_zh"] == "看过"
+
+    idx_subj = format_index_subject(
+        {"id": 10380, "type": 2, "name": "STEINS;GATE", "name_cn": "命运石之门", "comment": "Top 1"}
+    )
+    assert idx_subj["name_cn"] == "命运石之门"
+    assert idx_subj["type"] == "anime"

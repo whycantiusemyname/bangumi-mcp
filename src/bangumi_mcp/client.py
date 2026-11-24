@@ -1,17 +1,22 @@
-"""Async HTTP client for Bangumi API v0 with retries, rate-limit backoff, and clean errors."""
+"""Async HTTP client for Bangumi API v0 with safe retries, rate-limit handling, and clean errors."""
 
 from __future__ import annotations
 
 import asyncio
+import math
 import random
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
 from .config import BangumiConfig
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 class BangumiError(Exception):
@@ -28,6 +33,10 @@ class AuthRequiredError(BangumiError):
             "To enable personal read/write actions, generate a Personal Access Token at "
             "https://next.bgm.tv/demo/access-token and set the BANGUMI_ACCESS_TOKEN environment variable."
         )
+
+
+class UnsupportedUpstreamError(BangumiError):
+    """Raised when an endpoint is documented in OpenAPI but disabled/unregistered upstream."""
 
 
 class BangumiAPIError(BangumiError):
@@ -67,14 +76,45 @@ class BangumiAPIError(BangumiError):
         return payload
 
 
-def _parse_retry_after(header_value: str | None) -> float | None:
+def parse_retry_after(header_value: str | None) -> float | None:
+    """Parse HTTP Retry-After header (numeric seconds or RFC 9110 HTTP-date)."""
     if not header_value:
         return None
-    try:
-        delay = float(header_value.strip())
-        return max(0.0, min(delay, 30.0))
-    except ValueError:
+    raw = header_value.strip()
+    if not raw:
         return None
+    try:
+        seconds = float(raw)
+        if not math.isfinite(seconds) or seconds < 0:
+            return None
+        return seconds
+    except ValueError:
+        pass
+
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _validate_token_transport_security(base_url: str, access_token: str | None) -> None:
+    if not access_token:
+        return
+    parsed = urlparse(base_url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if scheme == "https":
+        return
+    if scheme == "http" and host in LOOPBACK_HOSTS:
+        return
+    raise BangumiError(
+        f"Refusing to send BANGUMI_ACCESS_TOKEN over insecure scheme ({scheme or 'unknown'}) "
+        f"to non-loopback host {host!r}. Use https:// for BANGUMI_BASE_URL."
+    )
 
 
 class BangumiClient:
@@ -86,6 +126,7 @@ class BangumiClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.config = config or BangumiConfig.from_env()
+        _validate_token_transport_security(self.config.base_url, self.config.access_token)
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
 
@@ -143,21 +184,27 @@ class BangumiClient:
         json_body: dict[str, Any] | None = None,
         require_auth: bool = False,
         action_name: str | None = None,
+        retryable: bool | None = None,
     ) -> Any:
+        method_upper = method.upper()
         if require_auth and not self.has_token:
-            raise AuthRequiredError(action_name or f"{method} {path}")
+            raise AuthRequiredError(action_name or f"{method_upper} {path}")
+
+        allow_retry = (
+            (method_upper in SAFE_RETRY_METHODS) if retryable is None else retryable
+        )
+        max_attempts = (self.config.max_retries + 1) if allow_retry else 1
 
         clean_params = (
             {k: v for k, v in params.items() if v is not None} if params is not None else None
         )
         client = self._get_client()
-        max_attempts = self.config.max_retries + 1
 
         last_exc: Exception | None = None
         for attempt in range(max_attempts):
             try:
                 response = await client.request(
-                    method,
+                    method_upper,
                     path,
                     params=clean_params,
                     json=json_body,
@@ -167,12 +214,32 @@ class BangumiClient:
                 if attempt + 1 < max_attempts:
                     await asyncio.sleep(self._backoff_delay(attempt))
                     continue
-                raise BangumiError(f"Network error calling {method} {path}: {exc}") from exc
+                if not allow_retry:
+                    raise BangumiError(
+                        f"Network/timeout error on non-retryable write {method_upper} {path}: {exc}. "
+                        "The server may have already applied this change; verify state before retrying."
+                    ) from exc
+                raise BangumiError(f"Network error calling {method_upper} {path}: {exc}") from exc
 
-            if response.status_code in RETRYABLE_STATUS_CODES and attempt + 1 < max_attempts:
-                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-                await asyncio.sleep(self._backoff_delay(attempt, retry_after))
-                continue
+            if response.status_code in RETRYABLE_STATUS_CODES:
+                retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                if (
+                    retry_after is not None
+                    and retry_after > self.config.max_retry_after
+                ):
+                    raise BangumiAPIError(
+                        status_code=response.status_code,
+                        title="Rate Limited" if response.status_code == 429 else "Service Unavailable",
+                        description=(
+                            f"Server requested Retry-After={retry_after:.1f}s, which exceeds "
+                            f"configured wait budget ({self.config.max_retry_after:.1f}s)."
+                        ),
+                        details={"retry_after_seconds": round(retry_after, 1)},
+                        path=path,
+                    )
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(self._backoff_delay(attempt, retry_after))
+                    continue
 
             if response.status_code >= 400:
                 title = response.reason_phrase or f"HTTP {response.status_code}"
@@ -188,7 +255,9 @@ class BangumiClient:
                     description = response.text[:300].strip()
 
                 if response.status_code == 401 and not description:
-                    description = "Invalid or expired BANGUMI_ACCESS_TOKEN, or insufficient scope."
+                    description = "Unauthorized: BANGUMI_ACCESS_TOKEN is invalid or expired."
+                elif response.status_code == 403 and not description:
+                    description = "Forbidden: token lacks required permission/scope or resource is restricted."
                 raise BangumiAPIError(
                     status_code=response.status_code,
                     title=title,
@@ -204,13 +273,13 @@ class BangumiClient:
                 return response.json()
             except ValueError as exc:
                 raise BangumiError(
-                    f"Invalid JSON response from {method} {path} (status {response.status_code})"
+                    f"Invalid JSON response from {method_upper} {path} (status {response.status_code})"
                 ) from exc
 
         raise BangumiError(f"Request failed after retries: {last_exc}")
 
     # ------------------------------------------------------------------
-    # Public Read-Only Endpoints
+    # Public Read-Only Endpoints (all safe to retry)
     # ------------------------------------------------------------------
 
     async def search_subjects(
@@ -256,6 +325,7 @@ class BangumiClient:
             "/v0/search/subjects",
             params={"limit": limit, "offset": offset},
             json_body=body,
+            retryable=True,
         )
 
     async def browse_subjects(
@@ -340,6 +410,7 @@ class BangumiClient:
             "/v0/search/characters",
             params={"limit": limit, "offset": offset},
             json_body=body,
+            retryable=True,
         )
 
     async def get_character(self, character_id: int) -> dict[str, Any]:
@@ -367,6 +438,7 @@ class BangumiClient:
             "/v0/search/persons",
             params={"limit": limit, "offset": offset},
             json_body=body,
+            retryable=True,
         )
 
     async def get_person(self, person_id: int) -> dict[str, Any]:
@@ -447,7 +519,7 @@ class BangumiClient:
         )
 
     # ------------------------------------------------------------------
-    # Authenticated Endpoints (require BANGUMI_ACCESS_TOKEN)
+    # Authenticated Endpoints (require BANGUMI_ACCESS_TOKEN; writes never auto-retry)
     # ------------------------------------------------------------------
 
     async def get_me(self) -> dict[str, Any]:
@@ -491,6 +563,7 @@ class BangumiClient:
             json_body=payload,
             require_auth=True,
             action_name=f"updating collection for subject {subject_id}",
+            retryable=False,
         )
 
     async def get_user_subject_episodes(
@@ -528,6 +601,7 @@ class BangumiClient:
             json_body={"type": status},
             require_auth=True,
             action_name=f"updating episode {episode_id} watch status",
+            retryable=False,
         )
 
     async def batch_update_user_episodes(
@@ -539,6 +613,7 @@ class BangumiClient:
             json_body={"episode_id": episode_ids, "type": status},
             require_auth=True,
             action_name=f"batch updating episode progress for subject {subject_id}",
+            retryable=False,
         )
 
     async def collect_character(self, character_id: int) -> None:
@@ -547,14 +622,13 @@ class BangumiClient:
             f"/v0/characters/{character_id}/collect",
             require_auth=True,
             action_name=f"collecting character {character_id}",
+            retryable=False,
         )
 
     async def uncollect_character(self, character_id: int) -> None:
-        await self.request(
-            "DELETE",
-            f"/v0/characters/{character_id}/collect",
-            require_auth=True,
-            action_name=f"uncollecting character {character_id}",
+        raise UnsupportedUpstreamError(
+            f"Uncollecting character {character_id} is currently unsupported by Bangumi API v0 "
+            "(upstream DELETE /v0/characters/{character_id}/collect route is disabled in bangumi/server)."
         )
 
     async def collect_person(self, person_id: int) -> None:
@@ -563,31 +637,61 @@ class BangumiClient:
             f"/v0/persons/{person_id}/collect",
             require_auth=True,
             action_name=f"collecting person {person_id}",
+            retryable=False,
         )
 
     async def uncollect_person(self, person_id: int) -> None:
-        await self.request(
-            "DELETE",
-            f"/v0/persons/{person_id}/collect",
-            require_auth=True,
-            action_name=f"uncollecting person {person_id}",
+        raise UnsupportedUpstreamError(
+            f"Uncollecting person {person_id} is currently unsupported by Bangumi API v0 "
+            "(upstream DELETE /v0/persons/{person_id}/collect route is disabled in bangumi/server)."
         )
 
     async def create_index(
         self, *, title: str | None = None, description: str | None = None
     ) -> dict[str, Any]:
+        """Create a Bangumi Index.
+
+        Current bangumi/server reads JSON {title, description} directly on POST /v0/indices.
+        For older deployments that ignore POST body and return an empty index, falls back to
+        a single PUT while preserving the created index_id in any follow-up error.
+        """
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        if description is not None:
+            body["description"] = description
+
         created = await self.request(
             "POST",
             "/v0/indices",
+            json_body=body or None,
             require_auth=True,
             action_name="creating a new index",
+            retryable=False,
         )
-        if created and isinstance(created, dict) and (title is not None or description is not None):
-            index_id = created.get("id")
-            if index_id:
+        if not isinstance(created, dict):
+            return {"created": True, **body}
+
+        index_id = created.get("id")
+        needs_followup = bool(
+            index_id
+            and (
+                (title is not None and created.get("title") != title)
+                or (description is not None and created.get("desc") != description)
+            )
+        )
+        if needs_followup:
+            try:
                 return await self.update_index(
-                    int(index_id), title=title, description=description
+                    int(index_id),
+                    title=title if title is not None else created.get("title", ""),
+                    description=description if description is not None else created.get("desc", ""),
                 )
+            except BangumiError as exc:
+                raise BangumiError(
+                    f"Index {index_id} was created, but setting title/description failed: {exc}. "
+                    f"Use update_index(index_id={index_id}) instead of creating a duplicate index."
+                ) from exc
         return created
 
     async def update_index(
@@ -597,38 +701,51 @@ class BangumiClient:
         title: str | None = None,
         description: str | None = None,
     ) -> dict[str, Any]:
+        """Edit a Bangumi Index. Handles both empty 200/204 responses (current Go handler) and JSON bodies."""
         body: dict[str, Any] = {}
         if title is not None:
             body["title"] = title
         if description is not None:
             body["description"] = description
-        return await self.request(
+        updated = await self.request(
             "PUT",
             f"/v0/indices/{index_id}",
             json_body=body,
             require_auth=True,
             action_name=f"editing index {index_id}",
+            retryable=False,
         )
+        if isinstance(updated, dict):
+            return updated
+        # Current upstream Go handler returns empty response on PUT; fetch refreshed detail best-effort
+        try:
+            refreshed = await self.get_index(index_id)
+            if isinstance(refreshed, dict):
+                return refreshed
+        except BangumiError:
+            pass
+        fallback: dict[str, Any] = {"id": index_id, "updated": True}
+        if title is not None:
+            fallback["title"] = title
+        if description is not None:
+            fallback["desc"] = description
+        return fallback
 
     async def add_index_subject(
         self,
         index_id: int,
         subject_id: int,
         *,
-        sort: int | None = None,
-        comment: str | None = None,
+        sort: int = 0,
+        comment: str = "",
     ) -> None:
-        body: dict[str, Any] = {"subject_id": subject_id}
-        if sort is not None:
-            body["sort"] = sort
-        if comment is not None:
-            body["comment"] = comment
         await self.request(
             "POST",
             f"/v0/indices/{index_id}/subjects",
-            json_body=body,
+            json_body={"subject_id": subject_id, "sort": sort, "comment": comment},
             require_auth=True,
             action_name=f"adding subject {subject_id} to index {index_id}",
+            retryable=False,
         )
 
     async def update_index_subject(
@@ -636,20 +753,17 @@ class BangumiClient:
         index_id: int,
         subject_id: int,
         *,
-        sort: int | None = None,
-        comment: str | None = None,
+        sort: int,
+        comment: str,
     ) -> None:
-        body: dict[str, Any] = {}
-        if sort is not None:
-            body["sort"] = sort
-        if comment is not None:
-            body["comment"] = comment
+        """Overwrite sort and comment for a subject in an index (inserts if absent upstream)."""
         await self.request(
             "PUT",
             f"/v0/indices/{index_id}/subjects/{subject_id}",
-            json_body=body,
+            json_body={"sort": sort, "comment": comment},
             require_auth=True,
             action_name=f"updating subject {subject_id} in index {index_id}",
+            retryable=False,
         )
 
     async def remove_index_subject(self, index_id: int, subject_id: int) -> None:
@@ -658,6 +772,7 @@ class BangumiClient:
             f"/v0/indices/{index_id}/subjects/{subject_id}",
             require_auth=True,
             action_name=f"removing subject {subject_id} from index {index_id}",
+            retryable=False,
         )
 
     async def collect_index(self, index_id: int) -> None:
@@ -666,6 +781,7 @@ class BangumiClient:
             f"/v0/indices/{index_id}/collect",
             require_auth=True,
             action_name=f"collecting index {index_id}",
+            retryable=False,
         )
 
     async def uncollect_index(self, index_id: int) -> None:
@@ -674,4 +790,5 @@ class BangumiClient:
             f"/v0/indices/{index_id}/collect",
             require_auth=True,
             action_name=f"uncollecting index {index_id}",
+            retryable=False,
         )

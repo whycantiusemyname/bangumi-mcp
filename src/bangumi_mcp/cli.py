@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import __version__
-from .client import BangumiClient, BangumiError
+from .client import LOOPBACK_HOSTS, BangumiClient, BangumiError
 from .config import BangumiConfig
 from .constants import parse_subject_types, parse_weekday
 from .formatters import (
@@ -19,7 +19,7 @@ from .formatters import (
     format_subject_summary,
     format_user,
 )
-from .server import create_server
+from .server import MCP_V2, create_server
 from .services import check_user_collections, sync_user_collections
 
 
@@ -27,6 +27,16 @@ def _print_json(data: object) -> None:
     text = json.dumps(data, ensure_ascii=False, indent=2)
     sys.stdout.buffer.write((text + "\n").encode("utf-8"))
     sys.stdout.buffer.flush()
+
+
+def _print_stderr(message: str) -> None:
+    sys.stderr.buffer.write((message + "\n").encode("utf-8"))
+    sys.stderr.buffer.flush()
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().lower().strip("[]")
+    return normalized in LOOPBACK_HOSTS
 
 
 # ----------------------------------------------------------------------
@@ -66,26 +76,61 @@ def build_mcp_parser() -> argparse.ArgumentParser:
         default="/mcp",
         help="HTTP endpoint path for streamable-http transport (default: /mcp).",
     )
+    parser.add_argument(
+        "--allow-token-over-http",
+        action="store_true",
+        help=(
+            "Opt in to exposing BANGUMI_ACCESS_TOKEN on a loopback streamable-http server "
+            "(disabled by default because streamable-http has no per-caller auth; rejected on non-loopback hosts)."
+        ),
+    )
     return parser
+
+
+def resolve_mcp_runtime_config(args: argparse.Namespace, base_config: BangumiConfig) -> BangumiConfig:
+    """Enforce safe token isolation for streamable-http transport."""
+    if args.transport != "streamable-http":
+        return base_config
+    if not base_config.access_token:
+        return base_config
+    if not args.allow_token_over_http:
+        _print_stderr(
+            "[bangumi-mcp] Running streamable-http in public read-only mode "
+            "(BANGUMI_ACCESS_TOKEN disabled; pass --allow-token-over-http on a loopback host to opt in)."
+        )
+        return base_config.without_token()
+    if not _is_loopback_host(args.host):
+        raise ValueError(
+            f"Refusing to expose BANGUMI_ACCESS_TOKEN over unauthenticated streamable-http on "
+            f"non-loopback host {args.host!r}. Bind to 127.0.0.1/localhost or unset BANGUMI_ACCESS_TOKEN."
+        )
+    return base_config
 
 
 def main_mcp(argv: Sequence[str] | None = None) -> int:
     parser = build_mcp_parser()
     args = parser.parse_args(argv)
+    try:
+        cfg = resolve_mcp_runtime_config(args, BangumiConfig.from_env())
+    except ValueError as exc:
+        _print_stderr(json.dumps({"error": True, "message": str(exc)}, ensure_ascii=False))
+        return 1
+
     server = create_server(
+        config=cfg,
         host=args.host,
         port=args.port,
         streamable_http_path=args.path,
     )
     if args.transport == "streamable-http":
-        try:
+        if MCP_V2:
             server.run(
                 transport="streamable-http",
                 host=args.host,
                 port=args.port,
                 streamable_http_path=args.path,
             )
-        except TypeError:  # pragma: no cover - mcp 1.x FastMCP takes host/port in __init__
+        else:  # pragma: no cover - mcp 1.x FastMCP takes host/port in __init__
             server.run(transport="streamable-http")
     else:
         server.run(transport="stdio")
@@ -146,13 +191,14 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Batch-check titles or subject IDs against a user's collections to avoid duplicate recommendations.",
     )
     p_check.add_argument(
-        "username",
-        help="Bangumi username to check against.",
+        "-u",
+        "--username",
+        help="Bangumi username to check against (defaults to BANGUMI_DEFAULT_USERNAME).",
     )
     p_check.add_argument(
         "items",
         nargs="*",
-        help="Candidate subject IDs or titles.",
+        help="Candidate subject IDs (e.g. id:10380 or 400602) or titles.",
     )
     p_check.add_argument(
         "--file",
@@ -201,15 +247,22 @@ def build_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run_cli_async(args: argparse.Namespace, config: BangumiConfig) -> int:
-    async with BangumiClient(config=config) as client:
+async def _run_cli_async(
+    args: argparse.Namespace,
+    config: BangumiConfig,
+    *,
+    client: BangumiClient | None = None,
+) -> int:
+    owns_client = client is None
+    active_client = client or BangumiClient(config=config)
+    try:
         if args.command == "sync":
             username = args.username or config.default_username
             if not username:
                 raise ValueError("username is required (pass argument or set BANGUMI_DEFAULT_USERNAME).")
             types = parse_subject_types(args.types) if args.types else None
             payload = await sync_user_collections(
-                client,
+                active_client,
                 username,
                 subject_types=types,
                 include_user=True,
@@ -220,17 +273,25 @@ async def _run_cli_async(args: argparse.Namespace, config: BangumiConfig) -> int
             if args.output:
                 summary = {
                     "username": payload["username"],
+                    "complete": payload["complete"],
                     "total_collections": payload["total_collections"],
                     "overall_by_status": payload["overall_by_status"],
                     "summary_by_type": payload["summary_by_type"],
                     "saved_to": payload["saved_to"],
                 }
+                if payload.get("warnings"):
+                    summary["warnings"] = payload["warnings"]
                 _print_json(summary)
             else:
                 _print_json(payload)
             return 0
 
         if args.command == "check":
+            username = args.username or config.default_username
+            if not username:
+                raise ValueError(
+                    "username is required (pass -u/--username or set BANGUMI_DEFAULT_USERNAME)."
+                )
             candidates: list[int | str] = list(args.items or [])
             if args.file:
                 lines = Path(args.file).read_text(encoding="utf-8").splitlines()
@@ -239,8 +300,8 @@ async def _run_cli_async(args: argparse.Namespace, config: BangumiConfig) -> int
                 raise ValueError("Provide at least one candidate title/subject_id or --file.")
             types = parse_subject_types(args.types) if args.types else None
             report = await check_user_collections(
-                client,
-                args.username,
+                active_client,
+                username,
                 candidates,
                 subject_types=types,
                 resolve_unmatched_via_search=not args.no_search,
@@ -250,7 +311,7 @@ async def _run_cli_async(args: argparse.Namespace, config: BangumiConfig) -> int
 
         if args.command == "search":
             types = parse_subject_types(args.types) if args.types else None
-            raw = await client.search_subjects(
+            raw = await active_client.search_subjects(
                 args.keyword,
                 sort=args.sort,
                 subject_types=types,
@@ -265,13 +326,13 @@ async def _run_cli_async(args: argparse.Namespace, config: BangumiConfig) -> int
             return 0
 
         if args.command == "subject":
-            raw = await client.get_subject(args.subject_id)
+            raw = await active_client.get_subject(args.subject_id)
             _print_json(format_subject_detail(raw))
             return 0
 
         if args.command == "calendar":
             wd = parse_weekday(args.weekday) if args.weekday else None
-            raw = await client.get_calendar()
+            raw = await active_client.get_calendar()
             _print_json({"days": format_calendar(raw, weekday_filter=wd)})
             return 0
 
@@ -279,16 +340,19 @@ async def _run_cli_async(args: argparse.Namespace, config: BangumiConfig) -> int
             username = args.username or config.default_username
             if not username:
                 raise ValueError("username is required (pass argument or set BANGUMI_DEFAULT_USERNAME).")
-            raw = await client.get_user(username)
+            raw = await active_client.get_user(username)
             _print_json(format_user(raw))
             return 0
 
         if args.command == "me":
-            raw = await client.get_me()
+            raw = await active_client.get_me()
             _print_json(format_user(raw))
             return 0
 
-    return 1
+        return 1
+    finally:
+        if owns_client:
+            await active_client.aclose()
 
 
 def main_cli(argv: Sequence[str] | None = None) -> int:
@@ -297,7 +361,7 @@ def main_cli(argv: Sequence[str] | None = None) -> int:
     config = BangumiConfig.from_env()
     try:
         return asyncio.run(_run_cli_async(args, config))
-    except (ValueError, BangumiError) as exc:
+    except (OSError, ValueError, BangumiError) as exc:
         err = json.dumps({"error": True, "message": str(exc)}, ensure_ascii=False)
-        sys.stderr.buffer.write((err + "\n").encode("utf-8"))
+        _print_stderr(err)
         return 1

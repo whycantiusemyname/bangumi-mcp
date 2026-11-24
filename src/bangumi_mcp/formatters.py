@@ -437,6 +437,7 @@ def format_index_subject(raw: dict[str, Any]) -> dict[str, Any]:
             "id": sid,
             "type": SUBJECT_TYPES.get(stype, stype),
             "name": raw.get("name"),
+            "name_cn": raw.get("name_cn"),
             "date": raw.get("date"),
             "comment": _truncate(raw.get("comment"), 240),
             "added_at": raw.get("added_at"),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import __version__
 
@@ -39,14 +39,30 @@ class BangumiConfig:
     """Runtime settings for BangumiClient and services."""
 
     base_url: str = DEFAULT_BASE_URL
-    access_token: str | None = None
+    access_token: str | None = field(default=None, repr=False)
     user_agent: str = DEFAULT_USER_AGENT
     default_username: str | None = None
     timeout: float = 20.0
     max_retries: int = 4
     retry_base_delay: float = 0.6
+    max_retry_after: float = 30.0
     page_delay: float = 0.2
     cache_ttl: float = 300.0
+
+    def without_token(self) -> BangumiConfig:
+        """Return a copy of this config with access_token cleared."""
+        return BangumiConfig(
+            base_url=self.base_url,
+            access_token=None,
+            user_agent=self.user_agent,
+            default_username=self.default_username,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            retry_base_delay=self.retry_base_delay,
+            max_retry_after=self.max_retry_after,
+            page_delay=self.page_delay,
+            cache_ttl=self.cache_ttl,
+        )
 
     @classmethod
     def from_env(cls) -> BangumiConfig:
@@ -62,6 +78,7 @@ class BangumiConfig:
             timeout=_float_env("BANGUMI_TIMEOUT", 20.0),
             max_retries=max(0, _int_env("BANGUMI_MAX_RETRIES", 4)),
             retry_base_delay=max(0.0, _float_env("BANGUMI_RETRY_BASE_DELAY", 0.6)),
+            max_retry_after=max(0.0, _float_env("BANGUMI_MAX_RETRY_AFTER", 30.0)),
             page_delay=max(0.0, _float_env("BANGUMI_PAGE_DELAY", 0.2)),
             cache_ttl=max(0.0, _float_env("BANGUMI_CACHE_TTL", 300.0)),
         )
